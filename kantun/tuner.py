@@ -21,10 +21,25 @@ from sklearn.metrics import (
 )
 
 
+def _auc_score(y_true, y_pred, y_prob, labels):
+    if len(labels) <= 2:
+        return roc_auc_score(y_true, y_prob)
+    return roc_auc_score(y_true, y_prob, multi_class="ovr", labels=labels)
+
+
+def _f1_score(y_true, y_pred, y_prob, labels):
+    average = "binary" if len(labels) <= 2 else "macro"
+    return f1_score(y_true, y_pred, average=average, pos_label=labels[-1] if average == "binary" else 1, zero_division=0)
+
+
+def _accuracy_score(y_true, y_pred, y_prob, labels):
+    return accuracy_score(y_true, y_pred)
+
+
 _CLASSIFICATION_SCORERS = {
-    "auc": lambda y_true, y_pred, y_prob: roc_auc_score(y_true, y_prob),
-    "f1": lambda y_true, y_pred, y_prob: f1_score(y_true, y_pred, zero_division=0),
-    "accuracy": lambda y_true, y_pred, y_prob: accuracy_score(y_true, y_pred),
+    "auc": _auc_score,
+    "f1": _f1_score,
+    "accuracy": _accuracy_score,
 }
 _REGRESSION_SCORERS = {
     "neg_mse": lambda y_true, y_pred: -mean_squared_error(y_true, y_pred),
@@ -134,10 +149,17 @@ class KantunSearch:
 
     def _score(self, model, X_val, y_val):
         if self.task == "classification":
-            y_prob = model.predict_proba(X_val)[:, 1]
-            y_pred = (y_prob >= 0.5).astype(int)
+            proba = model.predict_proba(X_val)
+            is_binary = proba.ndim == 1 or proba.shape[1] <= 2
+            y_prob = proba[:, 1] if (proba.ndim == 2 and is_binary) else proba
+            # model.predict() (not argmax) so labels stay correct even when
+            # classes_ isn't {0, 1, ..., K-1} -- e.g. KANBoostClassifier.
+            y_pred = model.predict(X_val)
+            labels = getattr(model, "classes_", None)
+            if labels is None:
+                labels = np.unique(y_val)
             scorer = _CLASSIFICATION_SCORERS[self.scoring]
-            return scorer(y_val, y_pred, y_prob)
+            return scorer(y_val, y_pred, y_prob, labels)
         else:
             y_pred = model.predict(X_val)
             scorer = _REGRESSION_SCORERS[self.scoring]
@@ -215,6 +237,14 @@ class KantunSearch:
             if mean_score > self.best_score_:
                 self.best_score_ = mean_score
                 self.best_params_ = params
+
+        if self.best_params_ is None:
+            first_error = next(
+                (r["error"] for r in self.cv_results_ if r.get("error")), "unknown error"
+            )
+            raise RuntimeError(
+                f"Every parameter combination failed on every fold; first error: {first_error}"
+            )
 
         # Refit best params on the full dataset for immediate use.
         final_params = {**self.best_params_, **self.fixed_params}
