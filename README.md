@@ -88,6 +88,47 @@ stopping kicks in during the search itself. You can override this with
 
 - `search_type="random"` (default): samples `n_iter` random combinations
 - `search_type="grid"`: tries every combination in `param_distributions`
+- `search_type="halving"`: successive halving -- starts every candidate
+  on a small, stratified subsample of each fold's *training* data (held-out
+  validation data is always full and untouched), keeps the top
+  `1/halving_factor` by score, and grows the training subsample by
+  `halving_factor` each round until a round trains on the full data.
+  Training-set size is the resource halved (not, say, `n_estimators`),
+  since it's the only resource meaningful for *any* estimator -- kantun
+  tunes arbitrary sklearn-compatible models, not just KANBoost. Useful
+  when you have more candidates than you can afford to fully evaluate.
+
+  ```python
+  search = KantunSearch(
+      KANBoostClassifier, param_space, search_type="halving",
+      n_iter=20, cv=3, halving_factor=3, min_resource=50,
+  )
+  ```
+
+## Speeding up an expensive search
+
+Two independent knobs, useful together or separately, both aimed at
+the case kantun was built for: tuning an estimator that's slow to
+fit per combination (like KANBoost, ~10-20x a tree ensemble):
+
+- **`n_jobs`**: evaluate multiple param combos concurrently (threads,
+  not processes -- safe for CUDA device selection, and PyTorch releases
+  the GIL during tensor ops so real overlap still happens).
+  ```python
+  search = KantunSearch(KANBoostClassifier, param_space, n_jobs=4)
+  ```
+- **`prune=True`**: abandon a combo after its *first* CV fold if that
+  fold's score already falls more than `prune_margin` standard
+  deviations (of the current best combo's own fold spread) below the
+  running best -- skips the remaining `cv - 1` folds for combos that
+  are essentially never going to become the best. A pruned combo's
+  single-fold score is recorded in `cv_results_` (`"pruned": True`) but
+  never becomes `best_params_`/`best_score_`. Off by default; the first
+  combo evaluated is never pruned (there's nothing to compare against
+  yet).
+  ```python
+  search = KantunSearch(KANBoostClassifier, param_space, prune=True, prune_margin=1.0)
+  ```
 
 ## License
 
