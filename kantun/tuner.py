@@ -76,7 +76,13 @@ class KantunSearch:
     model_cls : class
         Any estimator class with a scikit-learn-like fit/predict API.
     param_distributions : dict
-        Mapping from constructor kwarg name -> list of candidate values.
+        Mapping from constructor kwarg name -> either a list of candidate
+        values, or (for `search_type="random"`/`"halving"` only) a
+        callable `sampler(rng) -> value` for continuous ranges, where
+        `rng` is a `random.Random` instance seeded from `random_state`
+        (e.g. `"kan_lr": lambda rng: 10 ** rng.uniform(-3, -1)` for
+        log-uniform sampling). `search_type="grid"` requires plain lists
+        (a callable can't be enumerated).
     task : str, optional
         "classification" or "regression". Auto-detected from
         `hasattr(model_cls, "predict_proba")` if not given.
@@ -85,9 +91,12 @@ class KantunSearch:
         or "halving").
     cv : int
         Number of cross-validation folds.
-    scoring : str
-        classification: "auc" (default), "f1", "accuracy"
-        regression: "neg_mse" (default), "neg_mae"
+    scoring : str or callable
+        classification: "auc" (default), "f1", "accuracy", or a callable
+        `scorer(y_true, y_pred, y_prob, labels) -> float` (higher is
+        better).
+        regression: "neg_mse" (default), "neg_mae", or a callable
+        `scorer(y_true, y_pred) -> float` (higher is better).
     search_type : str
         "random" (default), "grid", or "halving" (successive halving --
         see below).
@@ -122,6 +131,20 @@ class KantunSearch:
     min_resource : int
         Only used when `search_type="halving"`: the smallest per-class
         training-set size used at the first rung.
+    time_budget_s : float, optional
+        Wall-clock budget in seconds. Checked between combos
+        (`search_type="random"`/`"grid"`, in batches of `n_jobs`) or
+        between rungs (`search_type="halving"`) -- never mid-fit, so a
+        combo already dispatched always finishes. At least one
+        combo/rung always runs regardless of budget. For "halving", if
+        the budget is hit before the final full-data rung, the best
+        candidate from the last completed rung is promoted to
+        `best_params_` so `fit()` still succeeds.
+    refit : bool, default=True
+        If True (default), refit `best_params_` on the full dataset and
+        store it as `best_estimator_`. Set False to skip that final fit
+        (e.g. when `model_cls` is expensive to train and you only need
+        `best_params_`/`cv_results_`) -- `best_estimator_` stays None.
     """
 
     def __init__(
@@ -131,7 +154,7 @@ class KantunSearch:
         task: str | None = None,
         n_iter: int = 10,
         cv: int = 3,
-        scoring: str | None = None,
+        scoring=None,
         search_type: str = "random",
         fixed_params: dict | None = None,
         use_eval_set: bool | None = None,
@@ -142,6 +165,8 @@ class KantunSearch:
         prune_margin: float = 1.0,
         halving_factor: int = 3,
         min_resource: int = 8,
+        time_budget_s: float | None = None,
+        refit: bool = True,
     ):
         self.model_cls = model_cls
         self.param_distributions = param_distributions
@@ -160,6 +185,8 @@ class KantunSearch:
         self.prune_margin = prune_margin
         self.halving_factor = halving_factor
         self.min_resource = min_resource
+        self.time_budget_s = time_budget_s
+        self.refit = refit
 
         if scoring is None:
             self.scoring = "auc" if self.task == "classification" else "neg_mse"
@@ -179,12 +206,23 @@ class KantunSearch:
         values = list(self.param_distributions.values())
 
         if self.search_type == "grid":
+            for k, v in zip(keys, values):
+                if callable(v):
+                    raise ValueError(
+                        f"param_distributions[{k!r}] is a callable sampler, which "
+                        "needs an enumerable list of values for search_type='grid'. "
+                        "Use search_type='random' or 'halving' for continuous "
+                        "(callable) parameter distributions."
+                    )
             for combo in itertools.product(*values):
                 yield dict(zip(keys, combo))
         else:
             rng = random.Random(self.random_state)
             for _ in range(self.n_iter):
-                yield {k: rng.choice(v) for k, v in self.param_distributions.items()}
+                yield {
+                    k: (v(rng) if callable(v) else rng.choice(v))
+                    for k, v in self.param_distributions.items()
+                }
 
     def _fit_one(self, model, X_train, y_train, X_val, y_val):
         if self.use_eval_set:
@@ -204,11 +242,11 @@ class KantunSearch:
             labels = getattr(model, "classes_", None)
             if labels is None:
                 labels = np.unique(y_val)
-            scorer = _CLASSIFICATION_SCORERS[self.scoring]
+            scorer = self.scoring if callable(self.scoring) else _CLASSIFICATION_SCORERS[self.scoring]
             return scorer(y_val, y_pred, y_prob, labels)
         else:
             y_pred = model.predict(X_val)
-            scorer = _REGRESSION_SCORERS[self.scoring]
+            scorer = self.scoring if callable(self.scoring) else _REGRESSION_SCORERS[self.scoring]
             return scorer(y_val, y_pred)
 
     def _subsample_train(self, X_train, y_train, n_resources):
@@ -334,17 +372,37 @@ class KantunSearch:
         return row
 
     # ------------------------------------------------------------------
+    def _budget_exceeded(self, start_time, rows) -> bool:
+        if self.time_budget_s is None or not rows:
+            return False
+        if time.time() - start_time < self.time_budget_s:
+            return False
+        if self.verbose:
+            print(f"[kantun] time_budget_s={self.time_budget_s} reached "
+                  f"after {len(rows)} combo(s); stopping search")
+        return True
+
     def _run_flat_search(self, candidates, X, y, splits):
         n = len(candidates)
+        start = time.time()
+        rows = []
+
         if self.n_jobs == 1:
-            return [
-                self._evaluate_combo(i, n, params, X, y, splits)
-                for i, params in enumerate(candidates)
-            ]
-        return Parallel(n_jobs=self.n_jobs, prefer="threads")(
-            delayed(self._evaluate_combo)(i, n, params, X, y, splits)
-            for i, params in enumerate(candidates)
-        )
+            for i, params in enumerate(candidates):
+                if self._budget_exceeded(start, rows):
+                    break
+                rows.append(self._evaluate_combo(i, n, params, X, y, splits))
+            return rows
+
+        for batch_start in range(0, n, self.n_jobs):
+            if self._budget_exceeded(start, rows):
+                break
+            batch = list(enumerate(candidates))[batch_start:batch_start + self.n_jobs]
+            rows.extend(Parallel(n_jobs=self.n_jobs, prefer="threads")(
+                delayed(self._evaluate_combo)(i, n, params, X, y, splits)
+                for i, params in batch
+            ))
+        return rows
 
     def _run_halving_search(self, candidates, X, y, splits):
         """Successive halving: start with all candidates at a small
@@ -361,7 +419,21 @@ class KantunSearch:
 
         rung = 0
         rows = []
+        start = time.time()
+        last_scored = []
         while True:
+            if self._budget_exceeded(start, rows):
+                if self.best_params_ is None and last_scored:
+                    best_row, best_mean = max(last_scored, key=lambda pair: pair[1])
+                    if self.verbose:
+                        print(f"[kantun] promoting best candidate from rung {rung - 1} "
+                              "(reached before the final full-data rung)")
+                    with self._best_lock:
+                        self.best_score_ = best_mean
+                        self.best_params_ = best_row["params"]
+                        self.best_std_ = best_row["std_score"]
+                break
+
             n = len(candidates)
             is_final_rung = n_resources >= n_train_full
             if self.n_jobs == 1:
@@ -386,6 +458,7 @@ class KantunSearch:
             scored = [(r, r["mean_score"]) for r in rung_rows if r["mean_score"] is not None]
             if not scored:
                 break  # every candidate at this rung failed; nothing to promote
+            last_scored = scored
             scored.sort(key=lambda pair: pair[1], reverse=True)
             n_survivors = max(1, len(scored) // self.halving_factor)
             candidates = [r["params"] for r, _ in scored[:n_survivors]]
@@ -435,10 +508,11 @@ class KantunSearch:
                 f"Every parameter combination failed on every fold; first error: {first_error}"
             )
 
-        # Refit best params on the full dataset for immediate use.
-        final_params = {**self.best_params_, **self.fixed_params}
-        self.best_estimator_ = self.model_cls(**final_params)
-        self.best_estimator_.fit(X, y)
+        if self.refit:
+            # Refit best params on the full dataset for immediate use.
+            final_params = {**self.best_params_, **self.fixed_params}
+            self.best_estimator_ = self.model_cls(**final_params)
+            self.best_estimator_.fit(X, y)
 
         return self
 
