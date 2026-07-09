@@ -291,6 +291,103 @@ def test_search_all_folds_fail_raises():
         assert "intentional failure" in str(e)
 
 
+def test_callable_param_distribution_samples_continuous_values():
+    X, y = make_classification(n_samples=250, n_features=4, random_state=0)
+    X_df = pd.DataFrame(X, columns=["a", "b", "c", "d"])
+
+    search = KantunSearch(
+        RandomForestClassifier,
+        {
+            "n_estimators": lambda rng: rng.randint(10, 50),
+            "max_depth": [3, 5],
+        },
+        n_iter=6, cv=2, scoring="f1", use_eval_set=False, random_state=0, verbose=False,
+    )
+    search.fit(X_df, y)
+
+    n_estimators_seen = {r["params"]["n_estimators"] for r in search.cv_results_}
+    assert all(10 <= v <= 50 for v in n_estimators_seen)
+    assert len(n_estimators_seen) > 1  # actually sampled a range, not a constant
+    assert search.best_estimator_ is not None
+
+
+def test_callable_param_distribution_rejected_for_grid():
+    X, y = make_classification(n_samples=100, n_features=4, random_state=0)
+    X_df = pd.DataFrame(X, columns=["a", "b", "c", "d"])
+
+    search = KantunSearch(
+        RandomForestClassifier,
+        {"n_estimators": lambda rng: rng.randint(10, 50)},
+        search_type="grid", cv=2, use_eval_set=False, random_state=0, verbose=False,
+    )
+    try:
+        search.fit(X_df, y)
+        raise AssertionError("callable param_distributions value was not rejected for grid search")
+    except ValueError:
+        pass
+
+
+def test_callable_scoring():
+    from sklearn.metrics import f1_score
+
+    def custom_scorer(y_true, y_pred, y_prob, labels):
+        return f1_score(y_true, y_pred, average="binary", pos_label=labels[-1], zero_division=0)
+
+    X, y = make_classification(n_samples=250, n_features=4, random_state=0)
+    X_df = pd.DataFrame(X, columns=["a", "b", "c", "d"])
+
+    search = KantunSearch(
+        RandomForestClassifier,
+        {"n_estimators": [10, 30]},
+        cv=2, scoring=custom_scorer, use_eval_set=False, random_state=0, verbose=False,
+    )
+    search.fit(X_df, y)
+    assert 0 <= search.best_score_ <= 1
+
+
+def test_time_budget_stops_search_early_but_still_yields_best_params():
+    X, y = make_classification(n_samples=400, n_features=6, random_state=0)
+    X_df = pd.DataFrame(X, columns=[f"f{i}" for i in range(6)])
+
+    search = KantunSearch(
+        RandomForestClassifier,
+        {"n_estimators": [10, 20, 30, 40, 50]},
+        n_iter=5, cv=3, scoring="f1", use_eval_set=False, random_state=0, verbose=False,
+        time_budget_s=1e-6,  # effectively zero -- must still complete >=1 combo
+    )
+    search.fit(X_df, y)
+    assert search.best_params_ is not None
+    assert len(search.cv_results_) < 5
+
+
+def test_time_budget_with_halving_promotes_last_rung_best():
+    X, y = make_classification(n_samples=600, n_features=6, random_state=0)
+    X_df = pd.DataFrame(X, columns=[f"f{i}" for i in range(6)])
+
+    search = KantunSearch(
+        RandomForestClassifier,
+        {"n_estimators": [10, 20, 30, 40]},
+        search_type="halving", cv=3, scoring="f1", use_eval_set=False,
+        random_state=0, verbose=False, time_budget_s=1e-6, min_resource=20,
+    )
+    search.fit(X_df, y)
+    assert search.best_params_ is not None
+
+
+def test_refit_false_skips_best_estimator():
+    X, y = make_classification(n_samples=200, n_features=4, random_state=0)
+    X_df = pd.DataFrame(X, columns=["a", "b", "c", "d"])
+
+    search = KantunSearch(
+        RandomForestClassifier,
+        {"n_estimators": [10, 20]},
+        cv=2, scoring="f1", use_eval_set=False, random_state=0, verbose=False, refit=False,
+    )
+    search.fit(X_df, y)
+    assert search.best_params_ is not None
+    assert search.best_estimator_ is None
+
+
 if __name__ == "__main__":
     test_search_with_sklearn_classifier()
     test_search_with_sklearn_regressor()
@@ -306,4 +403,10 @@ if __name__ == "__main__":
     test_halving_cv_results_have_rungs()
     test_halving_best_score_only_from_full_data_rung()
     test_search_all_folds_fail_raises()
+    test_callable_param_distribution_samples_continuous_values()
+    test_callable_param_distribution_rejected_for_grid()
+    test_callable_scoring()
+    test_time_budget_stops_search_early_but_still_yields_best_params()
+    test_time_budget_with_halving_promotes_last_rung_best()
+    test_refit_false_skips_best_estimator()
     print("All kantun tests passed.")

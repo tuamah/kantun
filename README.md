@@ -18,15 +18,13 @@ useful on its own.
 ## Install
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
+pip install kantun
 ```
 
 To also tune KANBoost models, install it separately:
 
 ```bash
-pip install -e ../kanboost_project   # local, or: pip install kanboost (once published to PyPI)
-# repo: https://github.com/tuamah/kanboost
+pip install kanboost
 ```
 
 ## Quickstart
@@ -81,8 +79,45 @@ stopping kicks in during the search itself. You can override this with
 
 ## Supported scoring
 
-- Classification: `"auc"` (default), `"f1"`, `"accuracy"`
-- Regression: `"neg_mse"` (default), `"neg_mae"`
+- Classification: `"auc"` (default), `"f1"`, `"accuracy"`, or a callable
+  `scorer(y_true, y_pred, y_prob, labels) -> float` (higher is better).
+- Regression: `"neg_mse"` (default), `"neg_mae"`, or a callable
+  `scorer(y_true, y_pred) -> float` (higher is better).
+
+## Continuous parameter ranges
+
+`param_distributions` values are usually lists, but for
+`search_type="random"`/`"halving"` (not `"grid"`, which must enumerate)
+a value can instead be a callable `sampler(rng) -> value`, where `rng`
+is a `random.Random` seeded from `random_state`:
+
+```python
+param_space = {
+    "n_estimators": [30, 60, 100],
+    "kan_lr": lambda rng: 10 ** rng.uniform(-3, -1),   # log-uniform
+    "learning_rate": lambda rng: rng.uniform(0.01, 0.3),  # linear-uniform
+}
+```
+
+## Time budget
+
+`time_budget_s` caps wall-clock search time. It's checked between combos
+(in batches of `n_jobs`) or between halving rungs -- never mid-fit, so a
+combo already dispatched always finishes, and at least one combo/rung
+always runs. If the budget is hit before halving's final full-data rung,
+the best candidate from the last completed rung is promoted so `fit()`
+still succeeds.
+
+```python
+search = KantunSearch(KANBoostClassifier, param_space, time_budget_s=600)
+```
+
+## Skipping the final refit
+
+By default `fit()` refits `best_params_` on the full dataset
+(`best_estimator_`). Pass `refit=False` to skip that -- useful when
+`model_cls` is expensive to train and you only need `best_params_`/
+`cv_results_`.
 
 ## Search types
 
