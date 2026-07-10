@@ -16,7 +16,7 @@ install kanboost separately if that's what you're tuning. This keeps
 kantun usable for tuning other custom estimators too.
 """
 
-from .tuner import KantunSearch
+from .tuner import KantunSearch, select_smallest_within_epsilon
 
-__version__ = "0.0.4"
-__all__ = ["KantunSearch"]
+__version__ = "0.0.5"
+__all__ = ["KantunSearch", "select_smallest_within_epsilon"]

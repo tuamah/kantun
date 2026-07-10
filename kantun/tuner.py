@@ -535,3 +535,36 @@ class KantunSearch:
             "mean_score", ascending=False, na_position="last"
         ).reset_index(drop=True)
         return df
+
+
+def select_smallest_within_epsilon(cv_results, complexity_fn, epsilon: float = 0.01) -> dict:
+    """Pick the lowest-complexity param combo from `cv_results` (e.g.
+    `KantunSearch.cv_results_` after a grid search) whose `mean_score` is
+    within `epsilon` of the best `mean_score` seen across all combos --
+    "smallest architecture that's still good enough", as opposed to
+    `KantunSearch.best_params_`, which is always the single
+    highest-scoring combo regardless of how much complexity it costs
+    over a nearly-as-good smaller one.
+
+    `complexity_fn(params: dict) -> float` scores one combo's "size" --
+    there's no universal definition of model complexity (parameter
+    count, weak-learner count, spline resolution, and their product all
+    give different answers), so this is required rather than guessed,
+    e.g. `lambda p: p["kan_grid"] * p["kan_k"] * p["n_estimators"]`.
+
+    Rows with an `"error"` key (a combo that failed to fit on every
+    fold) or a `None` `mean_score` (a halving-search rung that never ran)
+    are skipped.
+
+    Returns the winning row's own dict (`{"params", "mean_score",
+    "std_score", "seconds", ...}`) plus a `"complexity"` key. Raises
+    `ValueError` if no valid row exists.
+    """
+    valid = [r for r in cv_results if r.get("mean_score") is not None and not r.get("error")]
+    if not valid:
+        raise ValueError("no valid (non-errored, non-None-score) rows in cv_results to select from")
+
+    best_score = max(r["mean_score"] for r in valid)
+    qualifying = [r for r in valid if r["mean_score"] >= best_score - epsilon]
+    winner = min(qualifying, key=lambda r: complexity_fn(r["params"]))
+    return {**winner, "complexity": complexity_fn(winner["params"])}

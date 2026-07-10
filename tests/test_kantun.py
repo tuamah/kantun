@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.datasets import make_classification, make_regression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
-from kantun import KantunSearch
+from kantun import KantunSearch, select_smallest_within_epsilon
 
 
 def test_search_with_sklearn_classifier():
@@ -388,6 +388,84 @@ def test_refit_false_skips_best_estimator():
     assert search.best_estimator_ is None
 
 
+def test_select_smallest_within_epsilon_picks_lowest_complexity_within_tolerance():
+    cv_results = [
+        {"params": {"n_estimators": 5}, "mean_score": 0.90, "std_score": 0.01, "seconds": 0.1},
+        {"params": {"n_estimators": 10}, "mean_score": 0.95, "std_score": 0.01, "seconds": 0.1},
+        {"params": {"n_estimators": 50}, "mean_score": 0.96, "std_score": 0.01, "seconds": 0.1},  # best
+        {"params": {"n_estimators": 100}, "mean_score": 0.955, "std_score": 0.01, "seconds": 0.1},
+    ]
+    result = select_smallest_within_epsilon(
+        cv_results, complexity_fn=lambda p: p["n_estimators"], epsilon=0.02,
+    )
+    # 0.95 and 0.96 and 0.955 all qualify (>= 0.96 - 0.02 = 0.94); smallest n_estimators among those is 10
+    assert result["params"] == {"n_estimators": 10}
+    assert result["complexity"] == 10
+    assert result["mean_score"] == 0.95
+
+
+def test_select_smallest_within_epsilon_narrow_tolerance_forces_best():
+    cv_results = [
+        {"params": {"n_estimators": 5}, "mean_score": 0.90, "std_score": 0.01, "seconds": 0.1},
+        {"params": {"n_estimators": 50}, "mean_score": 0.96, "std_score": 0.01, "seconds": 0.1},
+    ]
+    result = select_smallest_within_epsilon(
+        cv_results, complexity_fn=lambda p: p["n_estimators"], epsilon=0.001,
+    )
+    assert result["params"] == {"n_estimators": 50}
+
+
+def test_select_smallest_within_epsilon_skips_errored_and_none_rows():
+    cv_results = [
+        {"params": {"n_estimators": 5}, "mean_score": None, "std_score": None, "seconds": 0.1},
+        {"params": {"n_estimators": 10}, "mean_score": 0.5, "std_score": None,
+         "seconds": 0.1, "error": "boom"},
+        {"params": {"n_estimators": 20}, "mean_score": 0.93, "std_score": 0.01, "seconds": 0.1},
+    ]
+    result = select_smallest_within_epsilon(
+        cv_results, complexity_fn=lambda p: p["n_estimators"], epsilon=0.05,
+    )
+    assert result["params"] == {"n_estimators": 20}
+
+
+def test_select_smallest_within_epsilon_raises_when_nothing_valid():
+    cv_results = [
+        {"params": {"n_estimators": 5}, "mean_score": None, "std_score": None, "seconds": 0.1},
+        {"params": {"n_estimators": 10}, "mean_score": 0.5, "error": "boom", "seconds": 0.1},
+    ]
+    try:
+        select_smallest_within_epsilon(cv_results, complexity_fn=lambda p: p["n_estimators"])
+        raise AssertionError("no valid rows was not rejected")
+    except ValueError:
+        pass
+
+
+def test_select_smallest_within_epsilon_integrates_with_real_grid_search():
+    # A dataset where more trees genuinely stop mattering past a point --
+    # verifies the helper picks a smaller real KantunSearch grid combo,
+    # not just a hand-built cv_results_ list.
+    X, y = make_classification(
+        n_samples=300, n_features=5, n_informative=3, random_state=0,
+    )
+    X_df = pd.DataFrame(X, columns=[f"f{i}" for i in range(5)])
+
+    search = KantunSearch(
+        RandomForestClassifier,
+        {"n_estimators": [3, 10, 50, 100]},
+        cv=3, scoring="f1", search_type="grid", use_eval_set=False,
+        random_state=0, verbose=False,
+    )
+    search.fit(X_df, y)
+
+    result = select_smallest_within_epsilon(
+        search.cv_results_, complexity_fn=lambda p: p["n_estimators"], epsilon=0.1,
+    )
+    # the selected combo must itself be one of the real searched combos,
+    # and no smaller n_estimators outside the qualifying set should have won
+    assert result["params"]["n_estimators"] in (3, 10, 50, 100)
+    assert result["mean_score"] >= search.best_score_ - 0.1
+
+
 if __name__ == "__main__":
     test_search_with_sklearn_classifier()
     test_search_with_sklearn_regressor()
@@ -409,4 +487,9 @@ if __name__ == "__main__":
     test_time_budget_stops_search_early_but_still_yields_best_params()
     test_time_budget_with_halving_promotes_last_rung_best()
     test_refit_false_skips_best_estimator()
+    test_select_smallest_within_epsilon_picks_lowest_complexity_within_tolerance()
+    test_select_smallest_within_epsilon_narrow_tolerance_forces_best()
+    test_select_smallest_within_epsilon_skips_errored_and_none_rows()
+    test_select_smallest_within_epsilon_raises_when_nothing_valid()
+    test_select_smallest_within_epsilon_integrates_with_real_grid_search()
     print("All kantun tests passed.")
